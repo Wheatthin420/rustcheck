@@ -3,7 +3,9 @@
 // Modes:
 //   rustcheck            cargo check, print only diagnostics NEW since last run
 //   rustcheck clippy     cargo clippy --all-targets, same diff logic
-//   rustcheck fmt        cargo fmt --check
+//   rustcheck fmt        cargo fmt --check (--write: format in place, like format-on-save)
+//   rustcheck fix        cargo clippy --fix (apply machine-applicable lints)
+//   rustcheck save       pipeline: fmt --write -> check-diff (the "on save" loop)
 //   rustcheck test       cargo test, filtered to results/errors only
 //   --reset              re-baseline without reporting churn
 //   -p PKG               restrict to one package    --jobs N   (default 3)
@@ -194,9 +196,13 @@ fn run_test(jobs: &str, pkg: Option<&str>) -> i32 {
     i32::from(!out.status.success())
 }
 
-fn run_fmt(jobs: &str, pkg: Option<&str>) -> i32 {
+fn run_fmt(_jobs: &str, pkg: Option<&str>, write: bool) -> i32 {
     let mut cmd = Command::new("cargo");
-    cmd.args(["fmt", "--check", "-j", jobs]);
+    if write {
+        cmd.arg("fmt");
+    } else {
+        cmd.arg("fmt").arg("--check");
+    }
     if let Some(p) = pkg {
         cmd.args(["-p", p]);
     }
@@ -213,13 +219,69 @@ fn run_fmt(jobs: &str, pkg: Option<&str>) -> i32 {
         String::from_utf8_lossy(&out.stderr)
     ));
     if out.status.success() {
-        println!("rustcheck[fmt]: clean");
+        if write {
+            println!("rustcheck[fmt]: formatted in place");
+        } else {
+            println!("rustcheck[fmt]: clean");
+        }
         0
     } else {
         for l in text.lines().take(60) {
             println!("{l}");
         }
-        println!("rustcheck[fmt]: diffs found (run `cargo fmt`)");
+        if write {
+            println!("rustcheck[fmt]: FAILED");
+        } else {
+            println!("rustcheck[fmt]: diffs found (run `rustcheck fmt --write`)");
+        }
+        1
+    }
+}
+
+// cargo clippy --fix: apply machine-applicable suggestions in place.
+fn run_fix(jobs: &str, pkg: Option<&str>) -> i32 {
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "clippy",
+        "--fix",
+        "--allow-dirty",
+        "--allow-staged",
+        "-j",
+        jobs,
+        "--all-targets",
+    ]);
+    if let Some(p) = pkg {
+        cmd.args(["-p", p]);
+    }
+    let out = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("rustcheck: failed to run cargo clippy --fix: {e}");
+            return 2;
+        }
+    };
+    let text = strip_ansi(&format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    ));
+    let fixed: Vec<&str> = text
+        .lines()
+        .filter(|l| {
+            l.contains("Fixed")
+                || l.contains("updated")
+                || l.contains("error")
+                || l.contains("warning: unused")
+        })
+        .collect();
+    for l in fixed.iter().take(30) {
+        println!("{l}");
+    }
+    if out.status.success() {
+        println!("rustcheck[fix]: done (git diff to review)");
+        0
+    } else {
+        println!("rustcheck[fix]: FAILED (does the crate compile?)");
         1
     }
 }
@@ -229,12 +291,14 @@ fn main() {
     let mut mode = String::from("check");
     let mut jobs = env::var("RUSTCHECK_JOBS").unwrap_or_else(|_| "3".to_string());
     let mut reset = false;
+    let mut write = false;
     let mut pkg: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "check" | "clippy" | "test" | "fmt" => mode = args[i].clone(),
+            "check" | "clippy" | "test" | "fmt" | "fix" | "save" => mode = args[i].clone(),
             "--reset" => reset = true,
+            "--write" => write = true,
             "--jobs" => {
                 i += 1;
                 if i < args.len() {
@@ -249,8 +313,9 @@ fn main() {
             }
             "-h" | "--help" => {
                 println!(
-                    "usage: rustcheck [check|clippy|fmt|test] [-p PKG] [--jobs N] [--reset]\n\
-                     prints only diagnostics NEW since the previous run; baseline lives in target/.rustcheck-<mode>.json"
+                    "usage: rustcheck [check|clippy|fmt|fix|save|test] [-p PKG] [--jobs N] [--reset] [--write]\n\
+                     prints only diagnostics NEW since the previous run; baseline lives in target/.rustcheck-<mode>.json\n\
+                     save = fmt --write then check-diff (the on-save loop); fix = clippy autofix in place"
                 );
                 return;
             }
@@ -261,7 +326,14 @@ fn main() {
 
     match mode.as_str() {
         "test" => std::process::exit(run_test(&jobs, pkg.as_deref())),
-        "fmt" => std::process::exit(run_fmt(&jobs, pkg.as_deref())),
+        "fmt" => std::process::exit(run_fmt(&jobs, pkg.as_deref(), write)),
+        "fix" => std::process::exit(run_fix(&jobs, pkg.as_deref())),
+        "save" => {
+            // format-on-save first; a fmt tool error aborts, unformatted diffs don't
+            if run_fmt(&jobs, pkg.as_deref(), true) == 2 {
+                std::process::exit(2);
+            }
+        }
         _ => {}
     }
 
@@ -294,9 +366,14 @@ fn main() {
         std::process::exit(2);
     }
 
+    let base_mode = if mode == "save" {
+        "check"
+    } else {
+        mode.as_str()
+    };
     let base_file = workspace_root()
         .join("target")
-        .join(format!(".rustcheck-{mode}.json"));
+        .join(format!(".rustcheck-{base_mode}.json"));
     let baseline: BTreeMap<String, Diag> = if reset {
         BTreeMap::new()
     } else {
